@@ -18,14 +18,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang_org/x/net/lex/httplex"
@@ -370,6 +374,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 			req.closeBody()
 			return nil, err
 		}
+		leakChan <- fmt.Sprintf("%p,create,%s\n", pconn, onelineTrace(debug.Stack()))
 
 		var resp *Response
 		if pconn.alt != nil {
@@ -1071,6 +1076,9 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 
 	pconn.br = bufio.NewReader(pconn)
 	pconn.bw = bufio.NewWriter(persistConnWriter{pconn})
+
+	leakChan <- fmt.Sprintf("%p,loops-start\n", pconn)
+
 	go pconn.readLoop()
 	go pconn.writeLoop()
 	return pconn, nil
@@ -1396,6 +1404,9 @@ func (pc *persistConn) mapRoundTripErrorAfterClosed(startBytesWritten int64) err
 func (pc *persistConn) readLoop() {
 	closeErr := errReadLoopExiting // default value, if not changed below
 	defer func() {
+		leakChan <- fmt.Sprintf("%p,read-closed\n", pc)
+	}()
+	defer func() {
 		pc.close(closeErr)
 		pc.t.removeIdleConn(pc)
 	}()
@@ -1657,6 +1668,9 @@ type nothingWrittenError struct {
 
 func (pc *persistConn) writeLoop() {
 	defer close(pc.writeLoopDone)
+	defer func() {
+		leakChan <- fmt.Sprintf("%p,write-closed\n", pc)
+	}()
 	for {
 		select {
 		case wr := <-pc.writech:
@@ -2165,4 +2179,49 @@ func (cl *connLRU) remove(pc *persistConn) {
 // len returns the number of items in the cache.
 func (cl *connLRU) len() int {
 	return len(cl.m)
+}
+
+func makeLogFile() *os.File {
+	logFile, err := ioutil.TempFile("", "transport-events-")
+	if err != nil {
+		panic(err)
+	}
+	return logFile
+}
+
+var leakChan = make(chan string, 10000)
+
+func leakLog() {
+	var logFile *os.File
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGUSR1)
+	for {
+		select {
+		case line := <-leakChan:
+			if logFile == nil || line == "" {
+				logFile = makeLogFile()
+			}
+			logFile.Write([]byte(line))
+			logFile.Sync()
+		case <-sigChan:
+			if logFile != nil {
+				logFile.Close()
+			}
+			logFile = makeLogFile()
+		}
+	}
+}
+
+func onelineTrace(trace []byte) string {
+	data := string(trace)
+	lines := strings.Split(data, "\n")
+	var fileLines []string
+	for i := 2; i < len(lines); i += 2 {
+		fileLines = append(fileLines, strings.TrimLeft(lines[i], "\t "))
+	}
+	return strings.Join(fileLines, " <- ")
+}
+
+func init() {
+	go leakLog()
 }
